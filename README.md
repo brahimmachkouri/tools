@@ -1,4 +1,4 @@
-# Utilitaires d'administration Docker, Caddy et LM Studio
+# Utilitaires d'administration Docker, QEMU/KVM, Caddy et LM Studio
 
 Une collection de scripts pour installer et maintenir quelques services sur un
 serveur Ubuntu. Ils sont autonomes, idempotents (on peut les relancer sans
@@ -8,6 +8,7 @@ arrière quand c'est possible.
 | Script | Rôle |
 |---|---|
 | [`install-docker.sh`](install-docker.sh) | Installe Docker CE depuis le dépôt officiel (Ubuntu, Mint, Pop!_OS…) |
+| [`install-qemu.sh`](install-qemu.sh) | Installe QEMU/KVM et libvirt sur Ubuntu 24.04 et ses dérivées |
 | [`install-dockhand.sh`](install-dockhand.sh) | Déploie [Dockhand](https://hub.docker.com/r/fnsys/dockhand) (gestion Docker web) via Docker Compose |
 | [`setup-caddy-proxies.py`](setup-caddy-proxies.py) | Génère les reverse proxies d'un Caddyfile depuis un fichier YAML |
 | [`lmsctl.sh`](lmsctl.sh) | Pilote LM Studio en mode headless (démon `llmster` + unité systemd) |
@@ -20,6 +21,9 @@ arrière quand c'est possible.
   supportées).
 - Pour `setup-caddy-proxies.py` : Python 3.9 ou plus récent, `python3-yaml` et
   Caddy 2.11.4 ou plus récent.
+- Pour `install-qemu.sh` : Ubuntu 24.04 (`noble`) ou une dérivée basée sur
+  Ubuntu 24.04 ; l'accélération matérielle KVM doit être disponible, sauf avec
+  l'option `--force`.
 - Les droits root (`sudo`) pour tout ce qui modifie le système.
 
 ## Installation
@@ -47,6 +51,29 @@ Tous les scripts partagent la même interface :
   particuliers (`2`, `130`…) sont décrits dans l'aide de chaque script.
 
 ## Utilisation
+
+### install-qemu.sh
+
+```bash
+sudo ./install-qemu.sh                 # QEMU/KVM, libvirt et virt-manager
+sudo ./install-qemu.sh --server        # sans interface graphique
+sudo ./install-qemu.sh --force         # continue même si KVM est indisponible
+./install-qemu.sh --dry-run            # simule sans modifier le système ni sudo
+```
+
+Le script installe QEMU, libvirt, OVMF (UEFI) et swtpm (TPM virtuel). Il active
+`libvirtd`, configure le réseau NAT `default` et ajoute l'utilisateur ayant
+lancé `sudo` aux groupes `libvirt` et `kvm`. Déconnecte-toi puis reconnecte-toi
+pour que ces groupes soient pris en compte. Les VM utilisent la connexion
+libvirt `qemu:///system`.
+
+`--server` omet `virt-manager`, `virt-viewer` et les paquets graphiques QEMU.
+Avec `--force`, l'installation continue même sans KVM, mais les VM seront très
+lentes. `--dry-run` ne lance pas `apt-get update` : la simulation s'appuie sur
+l'index APT déjà présent.
+
+> ⚠️ Les groupes `libvirt` et `kvm` permettent de piloter les machines
+> virtuelles du système : réserve-les aux comptes de confiance.
 
 ### install-docker.sh
 
