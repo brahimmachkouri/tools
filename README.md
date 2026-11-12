@@ -165,8 +165,6 @@ python3 -m py_compile setup-caddy-proxies.py
 Ces contrôles sont relancés automatiquement à chaque push et pull request
 (`.github/workflows/lint.yml`).
 
-## Historique et licence
-
-Les changements sont listés dans [CHANGELOG.md](CHANGELOG.md).
+## Licence
 
 Distribué sous licence MIT : voir [LICENSE](LICENSE).
