@@ -25,8 +25,8 @@ arrière quand c'est possible.
 ## Installation
 
 ```bash
-git clone <url-du-dépôt> utilitaires
-cd utilitaires
+git clone https://github.com/brahimmachkouri/tools.git 
+cd tools
 chmod +x *.sh *.py
 ```
 
