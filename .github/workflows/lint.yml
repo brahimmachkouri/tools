@@ -1,0 +1,28 @@
+# Analyse statique à chaque push et pull request :
+#   - ShellCheck sur les scripts Bash (réglages dans .shellcheckrc) ;
+#   - compilation du script Python (erreurs de syntaxe).
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck *.sh
+
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntaxe Python
+        run: python3 -m py_compile setup-caddy-proxies.py
