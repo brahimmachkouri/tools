@@ -219,6 +219,10 @@ SIGNATURE_HEADERS = (
     "X-AspNetMvc-Version",
 )
 
+# En-tête HSTS ajouté à chaque bloc HTTPS. Le navigateur retient pendant
+# max-age secondes (ici un an) qu'il doit utiliser HTTPS pour ce nom.
+HSTS_VALUE = "max-age=31536000"
+
 # Aucun contrôle d'accès n'est embarque par défaut. Tous les réglages sont
 # lus dans le YAML : globalement via 'settings', et surchargeables par site.
 ACCESS_PUBLIC = "public"
@@ -1152,6 +1156,7 @@ def render_managed_section(
         lines += [
             f"{hostname} {{",
             f"\timport {SIGNATURE_SNIPPET_NAME}",
+            f'\theader Strict-Transport-Security "{HSTS_VALUE}"',
             "",
         ]
 
