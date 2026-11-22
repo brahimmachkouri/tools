@@ -199,7 +199,7 @@ de chaque appareil associé :
 
 ```
 ── LM Link ──
-✅ LM Link en ligne — cet appareil : iam
+✅ LM Link en ligne — cet appareil : iastation
    Appareils connectés : 1 sur 3
      truc.local                           ⚪ déconnecté
      pop-os                               🟢 connecté
