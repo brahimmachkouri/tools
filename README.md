@@ -243,28 +243,6 @@ environnement :
 
 Lis l'aide (`--help`) de chaque script avant de l'utiliser en production.
 
-## Contribuer
-
-Les scripts Bash doivent passer [ShellCheck](https://www.shellcheck.net)
-sans avertissement :
-
-```bash
-sudo apt install shellcheck
-shellcheck *.sh
-python3 -m py_compile setup-caddy-proxies.py
-```
-
-`lmsctl.sh` a aussi des tests unitaires, qui tournent sans root, sans réseau et
-sans systemd (Linux, Bash ≥ 4.4) :
-
-```bash
-sudo apt install bats
-bats tests/
-```
-
-Ces contrôles sont relancés automatiquement à chaque push et pull request
-(`.github/workflows/lint.yml`).
-
 ## Licence
 
 Distribué sous licence MIT : voir [LICENSE](LICENSE).
