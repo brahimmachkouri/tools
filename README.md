@@ -21,6 +21,9 @@ arrière quand c'est possible.
   supportées).
 - Pour `setup-caddy-proxies.py` : Python 3.9 ou plus récent, `python3-yaml` et
   Caddy 2.11.4 ou plus récent.
+- Pour `lmsctl.sh` : systemd, `curl` et `libatomic1` (`libgomp1` recommandé),
+  sur x86_64 ou arm64. L'application desktop LM Studio ne doit pas tourner en
+  même temps : les deux partagent `~/.lmstudio`.
 - Pour `install-qemu.sh` : Ubuntu 24.04 (`noble`) ou une dérivée basée sur
   Ubuntu 24.04 ; l'accélération matérielle KVM doit être disponible, sauf avec
   l'option `--force`.
@@ -134,13 +137,30 @@ Toutes les clés du YAML sont documentées en tête du script.
 Fait tourner LM Studio sans interface graphique, comme un service systemd.
 
 ```bash
-sudoedit /etc/default/lmstudio-headless   # LMS_USER=..., SERVER_PORT=..., etc.
+sudoedit /etc/default/lmstudio-headless   # configuration (exemple ci-dessous)
 sudo ./lmsctl.sh check                    # valide la configuration
 sudo ./lmsctl.sh install                  # installe llmster et le service
 sudo ./lmsctl.sh status
+sudo ./lmsctl.sh configure                # applique une configuration modifiée
 sudo ./lmsctl.sh update                   # mise à jour avec retour arrière automatique
 ./lmsctl.sh help                          # liste des commandes et variables
 ```
+
+Exemple de `/etc/default/lmstudio-headless` (root:root, mode 0644). Seule
+`LMS_USER` est requise, et encore : elle vaut par défaut l'utilisateur qui a
+lancé `sudo`.
+
+```bash
+LMS_USER=ia
+SERVER_PORT=1234
+BIND_ADDR=127.0.0.1          # 0.0.0.0 seulement avec authentification et pare-feu
+PRELOAD_MODEL=qwen/qwen3-8b  # vide = aucun préchargement
+LOAD_ARGS="--context-length 32768 --gpu 1.0"
+WATCHDOG_INTERVAL=60         # 0 = pas de surveillance
+```
+
+Toute modification de ce fichier s'applique avec `configure`. Si le service ne
+redémarre pas avec la nouvelle configuration, l'ancienne est restaurée.
 
 `sudo ./lmsctl.sh health` renvoie `0` si l'API est saine, `1` si elle est
 injoignable, et `2` si le serveur répond mais rejette le jeton. Ces codes
@@ -154,8 +174,6 @@ secondes, 60 par défaut, `0` pour le désactiver) sonde l'API et redémarre le
 service après trois sondes sans réponse. Il ignore un service arrêté
 volontairement ou en échec, et ne fait rien pendant qu'une commande `lmsctl`
 est en cours.
-
-Les tests unitaires se lancent avec `bats tests/` (Linux, Bash ≥ 4.4).
 
 ### install-lmstudio.sh
 
@@ -192,12 +210,20 @@ Lis l'aide (`--help`) de chaque script avant de l'utiliser en production.
 ## Contribuer
 
 Les scripts Bash doivent passer [ShellCheck](https://www.shellcheck.net)
-sans avertissement. Les réglages du projet sont dans `.shellcheckrc` :
+sans avertissement :
 
 ```bash
 sudo apt install shellcheck
 shellcheck *.sh
 python3 -m py_compile setup-caddy-proxies.py
+```
+
+`lmsctl.sh` a aussi des tests unitaires, qui tournent sans root, sans réseau et
+sans systemd (Linux, Bash ≥ 4.4) :
+
+```bash
+sudo apt install bats
+bats tests/
 ```
 
 Ces contrôles sont relancés automatiquement à chaque push et pull request

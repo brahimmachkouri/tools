@@ -1,5 +1,5 @@
 # Analyse statique à chaque push et pull request :
-#   - ShellCheck sur les scripts Bash (réglages dans .shellcheckrc) ;
+#   - ShellCheck sur les scripts Bash ;
 #   - tests unitaires bats (tests/) ;
 #   - compilation du script Python (erreurs de syntaxe).
 name: lint
