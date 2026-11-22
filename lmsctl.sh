@@ -10,7 +10,7 @@
 #   lmsctl update      met à jour llmster avec sauvegarde et rollback ciblé
 #   lmsctl configure   applique la configuration avec rollback ciblé de l'unité
 #   lmsctl check       valide la configuration et l'unité sans les installer
-#   lmsctl start|stop|restart|status|health|logs|models
+#   lmsctl start|stop|restart|status|health|link|logs|models
 #   lmsctl uninstall   retire l'unité (llmster et les modèles restent)
 #
 # Configuration : /etc/default/lmstudio-headless (voir « lmsctl help »).
@@ -48,7 +48,9 @@
 #     modèles. La quarantaine de l'échec en cours n'est jamais purgée.
 #
 # Dépendances : bash ≥ 4.4, systemd, util-linux (runuser, flock), coreutils,
-# curl, iproute2 (ss), procps (pgrep), findutils. Voir « lmsctl help ».
+# curl, iproute2 (ss), procps (pgrep), findutils, libatomic1, libgomp1. Sur
+# Debian/Ubuntu, install et update installent curl, libatomic1 et libgomp1
+# s'ils manquent. Voir « lmsctl help ».
 
 # Vérifié avant « set -u » et avant toute fonction : un Bash trop ancien
 # échouerait plus loin avec des erreurs incompréhensibles.
@@ -316,6 +318,63 @@ check_runtime_libs() {
     | awk '$1=="libgomp.so.1"{f=1} END{exit !f}'; then
     warn "libgomp introuvable (libgomp1 sur Debian/Ubuntu) — à installer si llmster refuse de démarrer."
   fi
+}
+
+# Paquets Debian/Ubuntu requis : curl (installeur, sonde), libatomic1
+# (llmster, Node.js 25+) et libgomp1 (moteurs d'inférence).
+readonly APT_PACKAGES=(curl libatomic1 libgomp1)
+
+# Vrai si le système gère ses paquets avec APT/dpkg.
+apt_available() {
+  command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1
+}
+
+# Vrai si le paquet Debian $1 est installé.
+apt_package_installed() {
+  local state
+  # shellcheck disable=SC2016  # format dpkg-query, pas une variable shell
+  state="$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" || return 1
+  [[ "${state}" == "installed" ]]
+}
+
+# Affiche les paquets de APT_PACKAGES absents, un par ligne.
+missing_apt_packages() {
+  local pkg
+  for pkg in "${APT_PACKAGES[@]}"; do
+    if ! apt_package_installed "${pkg}"; then
+      printf '%s\n' "${pkg}"
+    fi
+  done
+}
+
+# Installe les paquets $@ sans interaction. Attend jusqu'à 2 min un verrou
+# dpkg tenu par unattended-upgrades plutôt que d'échouer aussitôt.
+apt_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    --no-install-recommends -o DPkg::Lock::Timeout=120 "$@" 9>&-
+}
+
+# Installe les paquets système manquants sur Debian/Ubuntu, en rafraîchissant
+# l'index APT seulement si nécessaire. Ailleurs, rien n'est installé :
+# check_runtime_libs et require_cmds indiquent alors quoi installer.
+ensure_system_packages() {
+  apt_available || return 0
+
+  local missing=()
+  mapfile -t missing < <(missing_apt_packages)
+  (( ${#missing[@]} > 0 )) || return 0
+
+  step "📦 Installation des paquets système manquants : ${missing[*]}"
+  if ! apt_install "${missing[@]}"; then
+    info "Nouvel essai après mise à jour de l'index APT."
+    apt-get update -qq -o DPkg::Lock::Timeout=120 9>&- \
+      || die "Mise à jour de l'index APT impossible." \
+             "Installe à la main : sudo apt install ${missing[*]}"
+    apt_install "${missing[@]}" \
+      || die "Installation des paquets impossible." \
+             "Installe à la main : sudo apt install ${missing[*]}"
+  fi
+  ok "Paquets installés : ${missing[*]}"
 }
 
 # --- Utilisateur et chemins --------------------------------------------------
@@ -956,13 +1015,166 @@ network_warning() {
   warn "Restreins également le port ${SERVER_PORT} avec le pare-feu."
 }
 
-# Affiche l'état de LM Link quand il est activé.
-show_link_status() {
-  [[ "${ENABLE_LM_LINK}" == "true" ]] || return 0
+# --- LM Link -----------------------------------------------------------------
+
+# Lit sur l'entrée standard la sortie de « lms link status --json » :
+#   {"status":"online","issues":[],"peers":[{"deviceName":"…","status":
+#    "connected","loadedModels":[…]}, …],"deviceName":"…"}
+# et écrit une ligne par élément, champs séparés par \037 (un séparateur non
+# blanc préserve les champs vides) :
+#   self  <status> <deviceName>
+#   issue <code>
+#   peer  <status> <nb modèles chargés> <deviceName>
+# Pas de jq : un petit analyseur awk suit la profondeur et la clé courante,
+# car « status » existe aussi dans chaque pair et un grep confondrait les deux.
+parse_link_json() {
+  awk '
+    function value(v) {
+      gsub(/[\037\t\r\n]/, " ", v)
+      if (depth == 1 && key[1] == "status") self_status = v
+      else if (depth == 1 && key[1] == "deviceName") self_name = v
+      else if (depth == 2 && key[1] == "issues") print "issue" FS_OUT v
+      else if (depth == 3 && key[1] == "peers" && key[3] == "deviceName") p_name = v
+      else if (depth == 3 && key[1] == "peers" && key[3] == "status") p_status = v
+      else if (depth == 4 && key[1] == "peers" && key[3] == "loadedModels") p_models++
+    }
+    { json = json $0 "\n" }
+    END {
+      FS_OUT = "\037"
+      n = length(json); depth = 0; i = 1
+      while (i <= n) {
+        c = substr(json, i, 1)
+        if (c == "\"") {
+          s = ""; i++
+          while (i <= n) {
+            c = substr(json, i, 1)
+            if (c == "\\") { s = s substr(json, i + 1, 1); i += 2; continue }
+            if (c == "\"") break
+            s = s c; i++
+          }
+          i++
+          j = i
+          while (j <= n && substr(json, j, 1) ~ /[ \t\r\n]/) j++
+          if (substr(json, j, 1) == ":") { key[depth] = s; i = j + 1 }
+          else value(s)
+          continue
+        }
+        if (c == "{" || c == "[") {
+          if (depth == 4 && key[1] == "peers" && key[3] == "loadedModels") p_models++
+          if (depth == 2 && key[1] == "peers" && c == "{") {
+            p_name = ""; p_status = ""; p_models = 0
+          }
+          depth++; key[depth] = ""; i++
+          continue
+        }
+        if (c == "}" || c == "]") {
+          if (depth == 3 && key[1] == "peers" && c == "}") {
+            print "peer" FS_OUT p_status FS_OUT (p_models + 0) FS_OUT p_name
+          }
+          depth--; i++
+          continue
+        }
+        if (c ~ /[-0-9a-z]/) {
+          s = ""
+          while (i <= n && substr(json, i, 1) !~ /[],} \t\r\n]/) {
+            s = s substr(json, i, 1); i++
+          }
+          value(s)
+          continue
+        }
+        i++
+      }
+      print "self" FS_OUT self_status FS_OUT self_name
+    }'
+}
+
+# Explication d'un code d'anomalie de LM Link.
+link_issue_text() {
+  case "$1" in
+    notLoggedIn) printf '%s' "cet appareil n'est connecté à aucun compte LM Studio" ;;
+    *)           printf 'anomalie signalée : %s' "$1" ;;
+  esac
+}
+
+# Affiche l'état de LM Link et de chaque appareil du réseau. À n'appeler
+# qu'une fois l'API vérifiée : sinon lms démarrerait un démon hors systemd.
+# 0 = LM Link en ligne (même si aucun autre appareil n'est allumé) ;
+# 1 = hors ligne ou état illisible.
+link_report() {
+  local raw kind a b c
+  local self_status="" self_name="" connected=0
+  local issues=() peers=()
+
   step "── LM Link ──"
-  if ! lms_cli link status; then
-    warn "LM Link n'est pas connecté. Lance « sudo -u ${LMS_USER} -H ${LMS_BIN} login », puis redémarre."
+  if ! raw="$(lms_cli link status --json 2>/dev/null)" || [[ "${raw}" != \{* ]]; then
+    warn "État de LM Link illisible (lms link status --json)."
+    return 1
   fi
+
+  while IFS=$'\037' read -r kind a b c; do
+    case "${kind}" in
+      self)  self_status="${a}"; self_name="${b}" ;;
+      issue) issues+=("${a}") ;;
+      peer)
+        peers+=("${a}"$'\037'"${b}"$'\037'"${c}")
+        if [[ "${a}" == "connected" ]]; then
+          connected=$((connected + 1))
+        fi
+        ;;
+    esac
+  done < <(parse_link_json <<<"${raw}")
+
+  local online="false"
+  if [[ "${self_status}" == "online" ]]; then
+    online="true"
+    ok "LM Link en ligne — cet appareil : ${self_name:-?}"
+  else
+    warn "LM Link hors ligne (${self_status:-état inconnu}) — cet appareil : ${self_name:-?}"
+  fi
+
+  local issue logged_out="false"
+  for issue in "${issues[@]}"; do
+    log "   ⚠️  $(link_issue_text "${issue}")"
+    if [[ "${issue}" == "notLoggedIn" ]]; then
+      logged_out="true"
+    fi
+  done
+
+  if (( ${#peers[@]} > 0 )); then
+    log "   Appareils connectés : ${connected} sur ${#peers[@]}"
+    local entry p_status p_models p_name label
+    for entry in "${peers[@]}"; do
+      IFS=$'\037' read -r p_status p_models p_name <<<"${entry}"
+      case "${p_status}" in
+        connected)    label="🟢 connecté" ;;
+        disconnected) label="⚪ déconnecté" ;;
+        *)            label="❔ ${p_status:-inconnu}" ;;
+      esac
+      if [[ "${p_models}" =~ ^[0-9]+$ ]] && (( p_models > 0 )); then
+        label+=", ${p_models} modèle(s) chargé(s)"
+      fi
+      log "     $(printf '%-36s' "${p_name:-?}") ${label}"
+    done
+  elif [[ "${online}" == "true" ]]; then
+    log "   Aucun autre appareil associé à ce compte."
+  fi
+
+  if [[ "${online}" == "true" ]]; then
+    if [[ "${ENABLE_LM_LINK}" == "false" ]]; then
+      info "Activé hors lmsctl : ENABLE_LM_LINK=true le réactivera à chaque démarrage."
+    fi
+    return 0
+  fi
+
+  if [[ "${logged_out}" == "true" ]]; then
+    hint "Connexion (une seule fois) : sudo -u ${LMS_USER} -H ${LMS_BIN} login"
+    hint "Puis : sudo ${SCRIPT_NAME} restart"
+  elif [[ "${ENABLE_LM_LINK}" == "false" ]]; then
+    hint "Activation : ENABLE_LM_LINK=true dans ${CONFIG_FILE}, puis sudo ${SCRIPT_NAME} configure"
+  else
+    hint "LM Link est réactivé à chaque démarrage : sudo ${SCRIPT_NAME} restart"
+  fi
+  return 1
 }
 
 # --- Sauvegarde et rollback ciblé --------------------------------------------
@@ -1443,6 +1655,7 @@ run_installer() {
 # install : (ré)installe llmster, écrit et active l'unité, démarre et vérifie.
 # Toute erreur après l'arrêt du service déclenche recover.
 cmd_install() {
+  ensure_system_packages
   require_cmds curl awk grep cp cmp ss find sort
   prepare_auth || die "Impossible de préparer l'authentification de la sonde."
   check_runtime_libs
@@ -1510,7 +1723,8 @@ cmd_install() {
   apply_watchdog
   network_warning
   if [[ "${ENABLE_LM_LINK}" == "true" ]]; then
-    show_link_status
+    # Informatif : LM Link dépend d'un compte et du réseau, pas de ce serveur.
+    link_report || true
   fi
   prune_failed_artifacts || warn "Purge des quarantaines impossible."
   finish_health_result
@@ -1519,6 +1733,7 @@ cmd_install() {
 # update : met à jour llmster si une nouvelle version existe, avec
 # sauvegarde préalable et restauration ciblée en cas d'échec.
 cmd_update() {
+  ensure_system_packages
   require_cmds curl awk grep cp cmp ss find sort
   require_installed
   require_unit
@@ -1795,10 +2010,9 @@ cmd_status() {
     log ""
     step "── Modèles en mémoire ──"
     lms_cli ps || true
-    if [[ "${ENABLE_LM_LINK}" == "true" ]]; then
-      log ""
-      show_link_status
-    fi
+    # Toujours affiché : LM Link peut avoir été activé hors lmsctl.
+    log ""
+    link_report || true
   elif lms_installed; then
     log ""
     step "── Détails LM Studio ──"
@@ -1835,6 +2049,24 @@ cmd_health() {
       ;;
   esac
   die "API injoignable sur le port ${SERVER_PORT} (dernier code : ${HEALTH_LAST_CODE})."
+}
+
+# link : état de LM Link et des appareils associés. 0 = en ligne, 1 = hors
+# ligne ou impossible à interroger. Un Mac éteint n'est pas une panne : seul
+# l'état de cet appareil compte pour le code de sortie.
+cmd_link() {
+  require_cmds curl
+  require_installed
+  prepare_auth || die "Impossible de préparer l'authentification de la sonde."
+  local rc=0
+  health_probe || rc=$?
+  if (( rc != 0 && rc != 2 )); then
+    die "API indisponible sur le port ${SERVER_PORT} : LM Link ne peut pas être interrogé sans démarrer le démon (sudo ${SCRIPT_NAME} start)."
+  fi
+  if link_report; then
+    return 0
+  fi
+  exit 1
 }
 
 # logs [N] : N dernières lignes du journal systemd (défaut : 100).
@@ -1874,6 +2106,14 @@ cmd_models() {
 # check : valide la configuration et l'unité générée sans rien installer.
 cmd_check() {
   require_cmds cmp
+  # check ne modifie rien : il signale seulement ce qu'install installerait.
+  if apt_available; then
+    local missing=()
+    mapfile -t missing < <(missing_apt_packages)
+    if (( ${#missing[@]} > 0 )); then
+      warn "Paquets système manquants : ${missing[*]} (installés automatiquement par « install »)."
+    fi
+  fi
   if [[ -n "${API_TOKEN_FILE}" ]]; then
     prepare_auth || die "Configuration API_TOKEN_FILE invalide."
   fi
@@ -1958,6 +2198,7 @@ Commandes :
   start | stop | restart
   status              état passif du service, du démon, du serveur, des modèles et Link
   health              sonde HTTP authentifiable, exploitable en supervision
+  link                état de LM Link et des appareils associés (0 = en ligne)
   logs [N]            N dernières lignes du journal (défaut : 100)
   models              modèles en mémoire et sur disque
   uninstall [--purge] retire l'unité (llmster et modèles conservés ; --purge
@@ -2005,6 +2246,12 @@ Notes :
     échec de chargement n'annule jamais une mise à jour (code 3).
   - LOAD_ARGS est lu depuis un fichier root ; contrôles, « % », « \$ », « \\ » et
     « ; » sont refusés (systemd les interpréterait).
+  - Sur Debian/Ubuntu, install et update installent curl, libatomic1 et libgomp1
+    s'ils manquent ; check se contente de les signaler.
+  - LM Link exige une connexion unique au compte LM Studio :
+      sudo -u ${LMS_USER:-<utilisateur>} -H ${LMS_BIN:-~/.lmstudio/bin/lms} login
+    puis ENABLE_LM_LINK=true et « ${SCRIPT_NAME} configure ». « link » renvoie 0
+    si LM Link est en ligne, même quand aucun autre appareil n'est allumé.
   - Le timer ${SERVICE_NAME}-watchdog.timer redémarre le service après 3 sondes
     muettes. Il ignore un service arrêté ou en échec, et s'efface devant lmsctl.
   - Avec 0.0.0.0, active Require Authentication et filtre le port au pare-feu.
@@ -2069,6 +2316,7 @@ main() {
     restart)   cmd_restart ;;
     status)    cmd_status ;;
     health)    cmd_health ;;
+    link)      cmd_link ;;
     logs)      cmd_logs "$@" ;;
     models)    cmd_models ;;
     uninstall) cmd_uninstall "$@" ;;

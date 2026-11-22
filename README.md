@@ -21,9 +21,11 @@ arrière quand c'est possible.
   supportées).
 - Pour `setup-caddy-proxies.py` : Python 3.9 ou plus récent, `python3-yaml` et
   Caddy 2.11.4 ou plus récent.
-- Pour `lmsctl.sh` : systemd, `curl` et `libatomic1` (`libgomp1` recommandé),
-  sur x86_64 ou arm64. L'application desktop LM Studio ne doit pas tourner en
-  même temps : les deux partagent `~/.lmstudio`.
+- Pour `lmsctl.sh` : systemd, sur x86_64 ou arm64, avec `curl`, `libatomic1`
+  et `libgomp1`. Sur Debian/Ubuntu, `install` et `update` installent ces trois
+  paquets s'ils manquent. Sur les autres distributions, rien n'est installé et
+  le script indique quoi installer. L'application desktop LM Studio ne doit pas
+  tourner en même temps : les deux partagent `~/.lmstudio`.
 - Pour `install-qemu.sh` : Ubuntu 24.04 (`noble`) ou une dérivée basée sur
   Ubuntu 24.04 ; l'accélération matérielle KVM doit être disponible, sauf avec
   l'option `--force`.
@@ -141,6 +143,7 @@ sudoedit /etc/default/lmstudio-headless   # configuration (exemple ci-dessous)
 sudo ./lmsctl.sh check                    # valide la configuration
 sudo ./lmsctl.sh install                  # installe llmster et le service
 sudo ./lmsctl.sh status
+sudo ./lmsctl.sh link                     # état de LM Link et des appareils associés
 sudo ./lmsctl.sh configure                # applique une configuration modifiée
 sudo ./lmsctl.sh update                   # mise à jour avec retour arrière automatique
 ./lmsctl.sh help                          # liste des commandes et variables
@@ -157,6 +160,7 @@ BIND_ADDR=127.0.0.1          # 0.0.0.0 seulement avec authentification et pare-f
 PRELOAD_MODEL=qwen/qwen3-8b  # vide = aucun préchargement
 LOAD_ARGS="--context-length 32768 --gpu 1.0"
 WATCHDOG_INTERVAL=60         # 0 = pas de surveillance
+ENABLE_LM_LINK=true          # voir « LM Link » ci-dessous
 ```
 
 Toute modification de ce fichier s'applique avec `configure`. Si le service ne
@@ -174,6 +178,38 @@ secondes, 60 par défaut, `0` pour le désactiver) sonde l'API et redémarre le
 service après trois sondes sans réponse. Il ignore un service arrêté
 volontairement ou en échec, et ne fait rien pendant qu'une commande `lmsctl`
 est en cours.
+
+#### LM Link
+
+[LM Link](https://lmstudio.ai/docs/lmlink) permet d'utiliser depuis un autre
+appareil, par exemple un portable, les modèles chargés sur ce serveur. Il exige
+que le serveur soit connecté une fois à ton compte LM Studio. `lmsctl` ne le
+fait pas à ta place, car la connexion est interactive :
+
+```bash
+sudo -u ia -H ~ia/.lmstudio/bin/lms login   # « ia » = LMS_USER ; une seule fois
+# puis ENABLE_LM_LINK=true dans /etc/default/lmstudio-headless
+sudo ./lmsctl.sh configure
+sudo ./lmsctl.sh link
+```
+
+`link` (également affiché par `status`) indique si LM Link est en ligne,
+pourquoi il ne l'est pas, par exemple faute de connexion au compte, et l'état
+de chaque appareil associé :
+
+```
+── LM Link ──
+✅ LM Link en ligne — cet appareil : iam
+   Appareils connectés : 1 sur 3
+     truc.local                           ⚪ déconnecté
+     pop-os                               🟢 connecté
+```
+
+Il renvoie `0` si LM Link est en ligne et `1` sinon. Un appareil éteint n'est
+pas une panne du serveur et ne change pas ce code. LM Link est réactivé à
+chaque démarrage du service, avec une attente limitée à 20 s : un réseau
+indisponible ne retarde jamais l'API locale. La surveillance de l'API ne
+redémarre jamais le service à cause de LM Link.
 
 ### install-lmstudio.sh
 

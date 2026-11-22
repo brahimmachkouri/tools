@@ -316,3 +316,130 @@ write_installer() {
   [ "$status" -eq 0 ]
   [[ "$output" == *WATCHDOG_INTERVAL* ]]
 }
+
+# --- LM Link -----------------------------------------------------------------
+
+# Sortie réelle de « lms link status --json » (identifiants anonymisés).
+LINK_ONLINE='{"status":"online","issues":[],"peers":[{"deviceIdentifier":"xxx","deviceName":"truc.iut-troyes.univ-reims.fr","status":"disconnected","loadedModels":[]},{"deviceIdentifier":"xxx2","deviceName":"truc.local","status":"disconnected","loadedModels":[]},{"deviceIdentifier":"xxx3","deviceName":"pop-os","status":"connected","loadedModels":[]}],"deviceIdentifier":"xxx4","deviceName":"iam"}'
+# Sortie réelle sur une machine non connectée à un compte.
+LINK_LOGGED_OUT='{"status":"offline","issues":["notLoggedIn"],"peers":[],"deviceIdentifier":null,"deviceName":"lima-lmsctl-test"}'
+
+# Rend parse_link_json lisible : \037 remplacé par « | ».
+parse_link() {
+  run bash -c 'source "${SCRIPT}"; parse_link_json | tr "\037" "|"' <<<"$1"
+}
+
+@test "parse_link_json : sortie réelle en ligne, « status » des pairs non confondu" {
+  parse_link "${LINK_ONLINE}"
+  [ "$status" -eq 0 ]
+  [ "$output" = "peer|disconnected|0|truc.iut-troyes.univ-reims.fr
+peer|disconnected|0|truc.local
+peer|connected|0|pop-os
+self|online|iam" ]
+}
+
+@test "parse_link_json : sortie réelle non connectée" {
+  parse_link "${LINK_LOGGED_OUT}"
+  [ "$output" = "issue|notLoggedIn
+self|offline|lima-lmsctl-test" ]
+}
+
+@test "parse_link_json : modèles chargés comptés, JSON indenté, guillemets échappés" {
+  parse_link '{
+    "peers": [ { "status": "connected", "deviceName": "mac \"pro\"",
+                 "loadedModels": [ {"id": "a", "tags": ["x", "y"]}, "b" ] } ],
+    "deviceName": "iam", "status": "online", "issues": [ ]
+  }'
+  [ "$output" = 'peer|connected|2|mac "pro"
+self|online|iam' ]
+}
+
+@test "link_report : en ligne → 0, appareils listés" {
+  ENABLE_LM_LINK=true in_script "lms_cli() { printf '%s' '${LINK_ONLINE}'; }
+    validate_config; rc=0; link_report || rc=\$?; echo \"rc=\${rc}\""
+  [ "${lines[-1]}" = "rc=0" ]
+  [[ "$output" == *"LM Link en ligne — cet appareil : iam"* ]]
+  [[ "$output" == *"Appareils connectés : 1 sur 3"* ]]
+  [[ "$output" =~ pop-os\ +🟢\ connecté ]]
+  [[ "$output" =~ truc\.local\ +⚪\ déconnecté ]]
+}
+
+@test "link_report : non connecté au compte → 1 et commande de connexion" {
+  ENABLE_LM_LINK=true in_script "lms_cli() { printf '%s' '${LINK_LOGGED_OUT}'; }
+    validate_config; LMS_BIN=/home/tester/.lmstudio/bin/lms
+    rc=0; link_report || rc=\$?; echo \"rc=\${rc}\""
+  [ "${lines[-1]}" = "rc=1" ]
+  [[ "$output" == *"aucun compte LM Studio"* ]]
+  [[ "$output" == *"sudo -u tester -H /home/tester/.lmstudio/bin/lms login"* ]]
+}
+
+@test "link_report : hors ligne et ENABLE_LM_LINK=false → conseil d'activation" {
+  in_script "lms_cli() { printf '%s' '{\"status\":\"offline\",\"issues\":[],\"peers\":[]}'; }
+    validate_config; rc=0; link_report || rc=\$?; echo \"rc=\${rc}\""
+  [ "${lines[-1]}" = "rc=1" ]
+  [[ "$output" == *"ENABLE_LM_LINK=true"* ]]
+}
+
+@test "link_report : sortie illisible → 1" {
+  in_script "lms_cli() { echo 'Error'; return 1; }
+    validate_config; rc=0; link_report || rc=\$?; echo \"rc=\${rc}\""
+  [ "${lines[-1]}" = "rc=1" ]
+  [[ "$output" == *"illisible"* ]]
+}
+
+# --- Paquets système ---------------------------------------------------------
+
+# dpkg-query répond « installed » sauf pour les paquets listés dans MISSING ;
+# apt-get journalise ses appels et échoue tant que APT_FAILS_ONCE n'est pas
+# consommé.
+fake_apt() {
+  fake dpkg-query '
+for pkg; do :; done
+case " ${MISSING:-} " in
+  *" ${pkg} "*) printf "not-installed" ;;
+  *) printf "installed" ;;
+esac'
+  fake apt-get '
+echo "$*" >>"${BATS_TEST_TMPDIR}/apt"
+if [ "$1" = install ] && [ -n "${APT_FAILS_ONCE:-}" ] && [ ! -e "${BATS_TEST_TMPDIR}/failed" ]; then
+  : >"${BATS_TEST_TMPDIR}/failed"; exit 100
+fi
+exit 0'
+}
+
+@test "paquets : rien à installer → aucun appel à apt-get" {
+  fake_apt
+  in_script 'ensure_system_packages; echo fin'
+  [ "$status" -eq 0 ]
+  [ ! -e "${BATS_TEST_TMPDIR}/apt" ]
+}
+
+@test "paquets : seuls les manquants sont installés" {
+  fake_apt
+  MISSING="libatomic1 libgomp1" in_script 'ensure_system_packages'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Paquets installés : libatomic1 libgomp1"* ]]
+  [ "$(wc -l <"${BATS_TEST_TMPDIR}/apt")" -eq 1 ]
+  [[ "$(cat "${BATS_TEST_TMPDIR}/apt")" == "install -y -qq --no-install-recommends -o DPkg::Lock::Timeout=120 libatomic1 libgomp1" ]]
+}
+
+@test "paquets : index APT rafraîchi seulement si le premier essai échoue" {
+  fake_apt
+  MISSING="curl" APT_FAILS_ONCE=1 in_script 'ensure_system_packages'
+  [ "$status" -eq 0 ]
+  [ "$(cut -d" " -f1 "${BATS_TEST_TMPDIR}/apt" | tr "\n" " ")" = "install update install " ]
+}
+
+@test "paquets : échec définitif → commande manuelle indiquée" {
+  fake_apt
+  fake apt-get 'exit 100'
+  MISSING="curl" in_script 'ensure_system_packages'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"sudo apt install curl"* ]]
+}
+
+@test "paquets : système sans APT → rien n'est tenté" {
+  in_script 'apt_available() { return 1; }; ensure_system_packages; echo fin'
+  [ "$status" -eq 0 ]
+  [ "$output" = "fin" ]
+}
