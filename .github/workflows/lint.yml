@@ -1,5 +1,6 @@
 # Analyse statique à chaque push et pull request :
 #   - ShellCheck sur les scripts Bash (réglages dans .shellcheckrc) ;
+#   - tests unitaires bats (tests/) ;
 #   - compilation du script Python (erreurs de syntaxe).
 name: lint
 
@@ -19,6 +20,16 @@ jobs:
         run: |
           shellcheck --version
           shellcheck *.sh
+
+  bats:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests unitaires (bats)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+          bats tests/
 
   python:
     runs-on: ubuntu-24.04

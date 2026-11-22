@@ -144,7 +144,18 @@ sudo ./lmsctl.sh update                   # mise à jour avec retour arrière au
 
 `sudo ./lmsctl.sh health` renvoie `0` si l'API est saine, `1` si elle est
 injoignable, et `2` si le serveur répond mais rejette le jeton. Ces codes
-conviennent à une supervision.
+conviennent à une supervision. `install`, `update`, `configure` et `start`
+renvoient `3` quand l'API est saine mais que le modèle `PRELOAD_MODEL` n'a pas
+pu être chargé : le préchargement n'est pas bloquant et n'annule jamais une
+mise à jour.
+
+Un timer systemd (`lmstudio-watchdog.timer`, toutes les `WATCHDOG_INTERVAL`
+secondes, 60 par défaut, `0` pour le désactiver) sonde l'API et redémarre le
+service après trois sondes sans réponse. Il ignore un service arrêté
+volontairement ou en échec, et ne fait rien pendant qu'une commande `lmsctl`
+est en cours.
+
+Les tests unitaires se lancent avec `bats tests/` (Linux, Bash ≥ 4.4).
 
 ### install-lmstudio.sh
 

@@ -30,7 +30,14 @@
 #     un jeton mal réglé ne doit jamais déclencher de restauration ;
 #   - aucun modèle n'est rechargé aveuglément après une mise à jour. Cela évite
 #     un double chargement et un OOM. PRELOAD_MODEL fournit le chargement
-#     déterministe ; sinon le prochain appel peut déclencher le JIT ;
+#     déterministe ; sinon le prochain appel peut déclencher le JIT. Le
+#     préchargement a lieu après le démarrage de l'API et n'est pas bloquant :
+#     un modèle introuvable ou trop gros ne doit pas faire annuler une mise à
+#     jour saine du binaire. Son échec est signalé par le code de sortie 3 ;
+#   - systemd ne voit qu'un oneshot : il ne peut pas relancer llmster s'il
+#     tombe. Un timer de surveillance (WATCHDOG_INTERVAL) sonde l'API et
+#     redémarre le service après plusieurs sondes muettes consécutives. Il
+#     s'efface devant lmsctl (même verrou) et ignore un service arrêté ;
 #   - LM Link est réactivé après le serveur, avec une attente strictement bornée,
 #     afin qu'un Mac hors ligne ne bloque jamais le démarrage de l'API ;
 #   - l'écoute réseau est locale par défaut. Une écoute LAN doit être protégée
@@ -57,8 +64,10 @@ set -Eeuo pipefail
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.0.0-rc7"
-readonly CONFIG_FILE="/etc/default/lmstudio-headless"
+readonly SCRIPT_VERSION="1.0.0-rc8"
+# Surchargeable (tests, instances multiples) ; le fichier désigné subit les
+# mêmes contrôles de propriétaire et de droits dans load_config.
+readonly CONFIG_FILE="${LMSCTL_CONFIG:-/etc/default/lmstudio-headless}"
 readonly INSTALLER_URL="https://lmstudio.ai/install.sh"
 
 # --- Affichage ---------------------------------------------------------------
@@ -134,6 +143,8 @@ ENABLE_LM_LINK="${ENABLE_LM_LINK:-false}"
 API_TOKEN_FILE="${API_TOKEN_FILE:-}"
 # Nombre de quarantaines d'échec conservées dans ${BACKUP_DIR}/failed. 0 = aucune.
 FAILED_RETENTION="${FAILED_RETENTION:-3}"
+# Intervalle en secondes du timer de surveillance de l'API. 0 = désactivé.
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-60}"
 
 # Charge ${CONFIG_FILE} s'il existe, après avoir vérifié qu'il
 # appartient à root et n'est modifiable que par lui (il est exécuté en root).
@@ -166,6 +177,10 @@ load_config() {
 load_config
 
 UNIT_PATH=""
+WATCHDOG_SERVICE_PATH=""
+WATCHDOG_TIMER_PATH=""
+WATCHDOG_HELPER_PATH=""
+MANAGED_PATHS=()
 LOCK_FILE=""
 BACKUP_DIR=""
 LMS_HOME=""
@@ -174,6 +189,16 @@ LMS_UID=""
 LMS_BIN=""
 TIMEOUT_BIN=""
 HEALTH_HOST=""
+
+# Hôte que la sonde locale doit interroger pour une adresse d'écoute $1.
+health_host_for() {
+  case "$1" in
+    0.0.0.0|127.0.0.1|localhost) printf '127.0.0.1' ;;
+    ::)                          printf '[::1]' ;;
+    *:*)                         printf '[%s]' "$1" ;;
+    *)                           printf '%s' "$1" ;;
+  esac
+}
 
 # Valide chaque variable de configuration (format, plage) et en dérive les
 # chemins : unité systemd, verrou, répertoire de sauvegarde, hôte de la sonde.
@@ -207,14 +232,17 @@ validate_config() {
     die "FAILED_RETENTION doit être compris entre 0 et 50."
   fi
 
+  [[ "${WATCHDOG_INTERVAL}" =~ ^[0-9]+$ ]] \
+    || die "WATCHDOG_INTERVAL doit être un entier."
+  WATCHDOG_INTERVAL=$((10#${WATCHDOG_INTERVAL}))
+  if (( WATCHDOG_INTERVAL != 0 \
+        && (WATCHDOG_INTERVAL < 15 || WATCHDOG_INTERVAL > 3600) )); then
+    die "WATCHDOG_INTERVAL doit valoir 0 (désactivé) ou être compris entre 15 et 3600 secondes."
+  fi
+
   [[ "${BIND_ADDR}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
     || die "BIND_ADDR contient des caractères non autorisés."
-  case "${BIND_ADDR}" in
-    0.0.0.0|127.0.0.1|localhost) HEALTH_HOST="127.0.0.1" ;;
-    ::)                          HEALTH_HOST="[::1]" ;;
-    *:*)                         HEALTH_HOST="[${BIND_ADDR}]" ;;
-    *)                           HEALTH_HOST="${BIND_ADDR}" ;;
-  esac
+  HEALTH_HOST="$(health_host_for "${BIND_ADDR}")"
 
   case "${ENABLE_LM_LINK,,}" in
     1|true|yes|on)  ENABLE_LM_LINK="true" ;;
@@ -227,9 +255,11 @@ validate_config() {
     die "PRELOAD_MODEL contient des caractères non autorisés."
   fi
 
-  if [[ "${LOAD_ARGS}" == *$'\n'* || "${LOAD_ARGS}" == *$'\r'* \
-        || "${LOAD_ARGS}" == *$'\t'* || "${LOAD_ARGS}" == *%* ]]; then
-    die "LOAD_ARGS ne peut contenir ni contrôle de ligne, ni tabulation, ni « % »."
+  # LOAD_ARGS est recopié dans une ligne Exec de l'unité. systemd y interprète
+  # « % » (spécificateurs), « $ » (variables), « \ » (échappements) et un « ; »
+  # isolé (séparateur de commandes) : tous sont refusés, comme les contrôles.
+  if [[ "${LOAD_ARGS}" == *[[:cntrl:]]* || "${LOAD_ARGS}" == *[%\$\\\;]* ]]; then
+    die "LOAD_ARGS ne peut contenir ni caractère de contrôle, ni « % », « \$ », « \\ » ou « ; »."
   fi
 
   if [[ -n "${API_TOKEN_FILE}" ]]; then
@@ -240,6 +270,12 @@ validate_config() {
   fi
 
   UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+  WATCHDOG_SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}-watchdog.service"
+  WATCHDOG_TIMER_PATH="/etc/systemd/system/${SERVICE_NAME}-watchdog.timer"
+  WATCHDOG_HELPER_PATH="/usr/local/libexec/${SERVICE_NAME}-watchdog"
+  # Fichiers gérés par lmsctl, sauvegardés et restaurés ensemble.
+  MANAGED_PATHS=("${UNIT_PATH}" "${WATCHDOG_SERVICE_PATH}"
+                 "${WATCHDOG_TIMER_PATH}" "${WATCHDOG_HELPER_PATH}")
   # /run et non /run/lock : ce dernier est ouvert en écriture à tous (1777),
   # n'importe quel utilisateur pourrait y créer le verrou avant root et le
   # garder indéfiniment.
@@ -455,9 +491,10 @@ service_active() {
 }
 
 # Vrai si un démon llmster tourne sous LMS_USER (même hors systemd).
+# Le nom exact du processus (comm), et non sa ligne de commande : un shell ou
+# un éditeur dont les arguments contiennent « llmster » ne doit pas compter.
 daemon_process_running() {
-  pgrep -u "${LMS_USER}" -f '(^|[ /])llmster([[:space:]]|$)' \
-    >/dev/null 2>&1
+  pgrep -u "${LMS_USER}" -x llmster >/dev/null 2>&1
 }
 
 # Refuse de continuer si l'application desktop tourne encore : elle
@@ -509,7 +546,10 @@ render_unit() {
     link_line="ExecStartPost=-${TIMEOUT_BIN} --signal=TERM 20s ${LMS_BIN} link enable"
   fi
   if [[ -n "${PRELOAD_MODEL}" ]]; then
-    preload_line="ExecStartPre=${LMS_BIN} load ${PRELOAD_MODEL} --yes"
+    # Après le serveur et préfixé de « - » : un échec de chargement (modèle
+    # absent, mémoire insuffisante) laisse l'API active et ne doit pas être
+    # confondu avec un binaire défectueux. preload_failed le détecte ensuite.
+    preload_line="ExecStartPost=-${LMS_BIN} load ${PRELOAD_MODEL} --yes"
     if [[ -n "${LOAD_ARGS}" ]]; then
       preload_line+=" ${LOAD_ARGS}"
     fi
@@ -533,8 +573,8 @@ Environment="PATH=${LMSTUDIO_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:
 UMask=0022
 NoNewPrivileges=true
 ExecStartPre=${LMS_BIN} daemon up
-${preload_line}
 ExecStart=${LMS_BIN} server start --port ${SERVER_PORT} --bind ${BIND_ADDR}
+${preload_line}
 ${link_line}
 ExecStop=-${LMS_BIN} daemon down
 TimeoutStartSec=600
@@ -546,38 +586,215 @@ WantedBy=multi-user.target
 EOF
 }
 
-# Fait valider l'unité $1 par systemd-analyze (si disponible) et affiche
-# ses remarques en cas d'échec.
-verify_unit_file() {
-  local candidate="$1"
-  command -v systemd-analyze >/dev/null 2>&1 || return 0
+# Script de surveillance exécuté en root par le timer. POSIX sh, sans
+# dépendance à lmsctl : il continue de fonctionner si le dépôt est déplacé.
+# Les valeurs injectées ont été validées (jeu de caractères sans apostrophe).
+render_watchdog_helper() {
+  cat <<EOF
+#!/bin/sh
+# Généré par ${SCRIPT_NAME} ${SCRIPT_VERSION}. Ne pas éditer à la main :
+# régler WATCHDOG_INTERVAL dans ${CONFIG_FILE} puis « ${SCRIPT_NAME} configure ».
+set -u
+SERVICE='${SERVICE_NAME}.service'
+BASE_URL='http://${HEALTH_HOST}:${SERVER_PORT}'
+TOKEN_FILE='${API_TOKEN_FILE}'
+LOCK_FILE='${LOCK_FILE}'
+EOF
+  cat <<'EOF'
+ATTEMPTS=3
+PAUSE=5
 
-  local report="${WORK_DIR}/systemd-verify.log"
-  if systemd-analyze verify "${candidate}" >"${report}" 2>&1; then
+# lmsctl détient ce verrou pendant toute opération (installation, mise à jour,
+# restauration) : la surveillance s'efface plutôt que d'interférer.
+exec 9>"${LOCK_FILE}" || exit 0
+flock -n 9 || exit 0
+
+# Arrêté volontairement, en cours de démarrage ou en échec : rien à faire.
+# Un service en échec n'est pas relancé en boucle.
+[ "$(systemctl is-active "${SERVICE}" 2>/dev/null)" = active ] || exit 0
+
+# Vrai si le serveur HTTP répond. Un 4xx (jeton refusé, chemin inconnu) prouve
+# qu'il est vivant ; seuls l'absence de réponse et les 5xx comptent comme panne.
+probe() {
+  for path in /api/v1/models /v1/models; do
+    if [ -n "${TOKEN_FILE}" ] && [ -r "${TOKEN_FILE}" ]; then
+      code=$(printf 'Authorization: Bearer %s\n' "$(cat -- "${TOKEN_FILE}")" \
+        | curl -s -o /dev/null -w '%{http_code}' --noproxy '*' \
+            --connect-timeout 2 --max-time 5 --header @- \
+            "${BASE_URL}${path}" 2>/dev/null) || code=000
+    else
+      code=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' \
+            --connect-timeout 2 --max-time 5 \
+            "${BASE_URL}${path}" 2>/dev/null) || code=000
+    fi
+    case "${code}" in
+      2??|3??) return 0 ;;
+      4??) [ "${path}" = /v1/models ] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+i=1
+while :; do
+  probe && exit 0
+  [ "${i}" -ge "${ATTEMPTS}" ] && break
+  i=$((i + 1))
+  sleep "${PAUSE}"
+done
+
+echo "API muette après ${ATTEMPTS} sondes : redémarrage de ${SERVICE}."
+exec systemctl restart "${SERVICE}"
+EOF
+}
+
+# Unité oneshot lancée par le timer.
+render_watchdog_service() {
+  cat <<EOF
+# Généré par ${SCRIPT_NAME}. Ne pas éditer à la main.
+[Unit]
+Description=Surveillance de l'API LM Studio (${SERVICE_NAME})
+After=${SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh ${WATCHDOG_HELPER_PATH}
+# Un redémarrage peut durer TimeoutStopSec + TimeoutStartSec du service.
+TimeoutStartSec=900
+EOF
+}
+
+# Le délai court à partir de la fin de la sonde précédente : deux sondes ne se
+# chevauchent jamais, même pendant un redémarrage long.
+render_watchdog_timer() {
+  cat <<EOF
+# Généré par ${SCRIPT_NAME}. Ne pas éditer à la main.
+[Unit]
+Description=Surveillance périodique de l'API LM Studio (${SERVICE_NAME})
+
+[Timer]
+OnActiveSec=${WATCHDOG_INTERVAL}s
+OnUnitInactiveSec=${WATCHDOG_INTERVAL}s
+AccuracySec=5s
+Unit=${SERVICE_NAME}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Génère dans WORK_DIR/units les fichiers attendus par la configuration.
+render_candidates() {
+  local dir="${WORK_DIR}/units"
+  rm -rf -- "${dir}"
+  install -d -m 0700 "${dir}" || return 1
+  render_unit >"${dir}/${SERVICE_NAME}.service" || return 1
+  if (( WATCHDOG_INTERVAL > 0 )); then
+    render_watchdog_helper >"${dir}/${SERVICE_NAME}-watchdog" || return 1
+    render_watchdog_service >"${dir}/${SERVICE_NAME}-watchdog.service" || return 1
+    render_watchdog_timer >"${dir}/${SERVICE_NAME}-watchdog.timer" || return 1
+  fi
+}
+
+# Fait valider les unités candidates par systemd-analyze (si disponible) et
+# affiche ses remarques en cas d'échec. Le script de surveillance est contrôlé
+# par sh -n.
+verify_candidates() {
+  local dir="${WORK_DIR}/units"
+  local units=("${dir}/${SERVICE_NAME}.service")
+  local line report="${WORK_DIR}/systemd-verify.log"
+
+  if (( WATCHDOG_INTERVAL > 0 )); then
+    units+=("${dir}/${SERVICE_NAME}-watchdog.service"
+            "${dir}/${SERVICE_NAME}-watchdog.timer")
+    if ! sh -n "${dir}/${SERVICE_NAME}-watchdog"; then
+      warn "Le script de surveillance généré est invalide."
+      return 1
+    fi
+  fi
+
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  if systemd-analyze verify "${units[@]}" >"${report}" 2>&1; then
     return 0
   fi
 
-  warn "L'unité systemd générée est invalide :"
+  warn "Les unités systemd générées sont invalides :"
   while IFS= read -r line; do
     warn "  ${line}"
   done <"${report}"
   return 1
 }
 
-# Génère, valide puis installe l'unité, uniquement si elle a changé.
-write_unit() {
-  local candidate="${WORK_DIR}/${SERVICE_NAME}.service"
-  render_unit >"${candidate}" || return 1
-  verify_unit_file "${candidate}" || return 1
+UNITS_CHANGED="false"
 
-  if [[ -f "${UNIT_PATH}" ]] && cmp -s "${candidate}" "${UNIT_PATH}"; then
-    log "   Unité systemd déjà à jour."
+# Installe le candidat $1 en $2 (mode $3, root:root) s'il diffère.
+sync_managed_file() {
+  local candidate="$1" target="$2" mode="$3"
+  if [[ -f "${target}" && ! -L "${target}" ]] && cmp -s "${candidate}" "${target}"; then
     return 0
   fi
+  install -D -m "${mode}" -o root -g root "${candidate}" "${target}" || return 1
+  UNITS_CHANGED="true"
+  log "   Écrit : ${target}"
+}
 
-  install_root_file "${candidate}" "${UNIT_PATH}" || return 1
-  systemctl daemon-reload || return 1
-  log "   Unité écrite : ${UNIT_PATH}"
+# Désactive le timer de surveillance et retire ses fichiers s'ils existent.
+remove_watchdog_files() {
+  if [[ -f "${WATCHDOG_TIMER_PATH}" ]]; then
+    systemctl disable --now "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 || true
+  fi
+  local path
+  for path in "${WATCHDOG_TIMER_PATH}" "${WATCHDOG_SERVICE_PATH}" \
+              "${WATCHDOG_HELPER_PATH}"; do
+    if [[ -e "${path}" || -L "${path}" ]]; then
+      rm -f -- "${path}" || return 1
+      UNITS_CHANGED="true"
+      log "   Retiré : ${path}"
+    fi
+  done
+}
+
+# Génère, valide puis installe les fichiers gérés, uniquement s'ils ont changé.
+# Le timer n'est pas (ré)armé ici : apply_watchdog le fait une fois le service
+# vérifié.
+write_units() {
+  local dir="${WORK_DIR}/units"
+  UNITS_CHANGED="false"
+  render_candidates || return 1
+  verify_candidates || return 1
+
+  sync_managed_file "${dir}/${SERVICE_NAME}.service" "${UNIT_PATH}" 0644 \
+    || return 1
+  if (( WATCHDOG_INTERVAL > 0 )); then
+    sync_managed_file "${dir}/${SERVICE_NAME}-watchdog" \
+      "${WATCHDOG_HELPER_PATH}" 0755 || return 1
+    sync_managed_file "${dir}/${SERVICE_NAME}-watchdog.service" \
+      "${WATCHDOG_SERVICE_PATH}" 0644 || return 1
+    sync_managed_file "${dir}/${SERVICE_NAME}-watchdog.timer" \
+      "${WATCHDOG_TIMER_PATH}" 0644 || return 1
+  else
+    remove_watchdog_files || return 1
+  fi
+
+  if [[ "${UNITS_CHANGED}" == "true" ]]; then
+    systemctl daemon-reload || return 1
+  else
+    log "   Unités systemd déjà à jour."
+  fi
+}
+
+# Arme le timer de surveillance si la configuration le demande. Le redémarrage
+# du timer applique un éventuel nouvel intervalle. Un échec ici ne justifie pas
+# d'annuler une opération dont le service a été vérifié : simple avertissement.
+apply_watchdog() {
+  (( WATCHDOG_INTERVAL > 0 )) || return 0
+  if systemctl enable "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 \
+      && systemctl restart "${SERVICE_NAME}-watchdog.timer"; then
+    log "   Surveillance de l'API toutes les ${WATCHDOG_INTERVAL}s."
+    return 0
+  fi
+  warn "Impossible d'armer ${SERVICE_NAME}-watchdog.timer : le service tourne sans surveillance."
+  return 0
 }
 
 # --- Santé -------------------------------------------------------------------
@@ -678,13 +895,49 @@ health_snapshot() {
   interpret_health_rc "${rc}"
 }
 
+PRELOAD_FAILED="false"
+
+# Le préchargement est un ExecStartPost non bloquant, terminé quand
+# « systemctl start » rend la main. On vérifie le résultat réel plutôt que son
+# code de sortie (systemd l'oublie au premier daemon-reload) : le modèle doit
+# figurer dans « lms ps --json », par clé, identifiant ou chemin. Une
+# correspondance partielle est acceptée, « lms load » résolvant les noms
+# approchés. Si la liste est illisible, aucun échec n'est inventé.
+# À n'appeler qu'une fois l'API vérifiée : lms ne doit pas démarrer de démon.
+check_preload() {
+  PRELOAD_FAILED="false"
+  [[ -n "${PRELOAD_MODEL}" ]] || return 0
+
+  local listing value
+  if ! listing="$(lms_cli ps --json 2>/dev/null)" || [[ "${listing}" != \[* ]]; then
+    warn "Impossible de vérifier le préchargement de ${PRELOAD_MODEL} (lms ps --json)."
+    return 0
+  fi
+
+  while IFS= read -r value; do
+    if [[ "${value,,}" == *"${PRELOAD_MODEL,,}"* ]]; then
+      return 0
+    fi
+  done < <(grep -oE '"(modelKey|identifier|path|indexedModelIdentifier)":"[^"]*"' \
+             <<<"${listing}" | cut -d'"' -f4 || true)
+
+  PRELOAD_FAILED="true"
+  warn "Le modèle ${PRELOAD_MODEL} n'est pas en mémoire après le démarrage (API pourtant active)."
+  hint "Diagnostic : sudo ${SCRIPT_NAME} logs — modèle absent ou mémoire insuffisante ?"
+}
+
 # Une réponse 401/403 prouve que le service est vivant : l'opération est donc
 # conservée, mais son résultat ne doit pas être annoncé comme entièrement sain.
+# De même pour un préchargement raté : l'API fonctionne, pas le modèle attendu.
 # exit est volontaire : un simple return 2 sous set -e déclencherait le trap ERR.
 finish_health_result() {
   if [[ "${HEALTH_DEGRADED}" == "true" ]]; then
     warn "Opération conservée, mais contrôle authentifié impossible."
     exit 2
+  fi
+  if [[ "${PRELOAD_FAILED}" == "true" ]]; then
+    warn "Opération conservée, mais le modèle ${PRELOAD_MODEL} n'est pas chargé."
+    exit 3
   fi
 }
 
@@ -920,27 +1173,62 @@ restore_bin() {
   log "   Copie sauvegardée restaurée dans ${current}"
 }
 
-# Mémorise l'unité actuelle et son état enabled/disabled.
+HAD_FILES=()
+WAS_TIMER_ENABLED="false"
+WAS_TIMER_ACTIVE="false"
+
+# Mémorise les fichiers gérés (unité, surveillance) et l'état
+# enabled/active du service et du timer.
 backup_unit_state() {
+  local dir="${WORK_DIR}/managed.previous" i
   HAD_UNIT="false"
   WAS_ENABLED="false"
+  WAS_TIMER_ENABLED="false"
+  WAS_TIMER_ACTIVE="false"
+  HAD_FILES=()
 
-  if [[ -f "${UNIT_PATH}" ]]; then
-    cp -a -- "${UNIT_PATH}" "${WORK_DIR}/unit.previous" || return 1
-    HAD_UNIT="true"
-  fi
+  install -d -m 0700 "${dir}" || return 1
+  for i in "${!MANAGED_PATHS[@]}"; do
+    HAD_FILES[i]="false"
+    if [[ -f "${MANAGED_PATHS[i]}" ]]; then
+      cp -a -- "${MANAGED_PATHS[i]}" "${dir}/${i}" || return 1
+      HAD_FILES[i]="true"
+    fi
+  done
+  HAD_UNIT="${HAD_FILES[0]}"
+
   if systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
     WAS_ENABLED="true"
   fi
+  if systemctl is-enabled --quiet "${SERVICE_NAME}-watchdog.timer" 2>/dev/null; then
+    WAS_TIMER_ENABLED="true"
+  fi
+  if systemctl is-active --quiet "${SERVICE_NAME}-watchdog.timer" 2>/dev/null; then
+    WAS_TIMER_ACTIVE="true"
+  fi
 }
 
-# Restaure l'unité et son état enabled/disabled mémorisés.
+# Restaure les fichiers gérés et l'état enabled/active mémorisés.
 restore_unit_state() {
-  if [[ "${HAD_UNIT}" == "true" ]]; then
-    install_root_file "${WORK_DIR}/unit.previous" "${UNIT_PATH}" || return 1
-  else
-    rm -f -- "${UNIT_PATH}" || return 1
+  local dir="${WORK_DIR}/managed.previous" i path mode
+
+  # Un timer apparu pendant l'opération est désarmé avant d'être retiré.
+  if [[ "${HAD_FILES[2]:-false}" == "false" && -f "${WATCHDOG_TIMER_PATH}" ]]; then
+    systemctl disable --now "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 || true
   fi
+
+  for i in "${!MANAGED_PATHS[@]}"; do
+    path="${MANAGED_PATHS[i]}"
+    mode="0644"
+    if [[ "${path}" == "${WATCHDOG_HELPER_PATH}" ]]; then
+      mode="0755"
+    fi
+    if [[ "${HAD_FILES[i]:-false}" == "true" ]]; then
+      install -D -m "${mode}" -o root -g root "${dir}/${i}" "${path}" || return 1
+    else
+      rm -f -- "${path}" || return 1
+    fi
+  done
 
   systemctl daemon-reload || return 1
   if [[ "${WAS_ENABLED}" == "true" ]]; then
@@ -948,6 +1236,40 @@ restore_unit_state() {
   else
     systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   fi
+
+  [[ "${HAD_FILES[2]:-false}" == "true" ]] || return 0
+  if [[ "${WAS_TIMER_ENABLED}" == "true" ]]; then
+    systemctl enable "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 || return 1
+  else
+    systemctl disable "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 || true
+  fi
+  if [[ "${WAS_TIMER_ACTIVE}" == "true" ]]; then
+    systemctl restart "${SERVICE_NAME}-watchdog.timer" || return 1
+  else
+    systemctl stop "${SERVICE_NAME}-watchdog.timer" >/dev/null 2>&1 || true
+  fi
+}
+
+# Après restauration, le service écoute selon l'ancienne unité, pas selon la
+# nouvelle configuration : la sonde doit viser son port et son adresse, relus
+# dans la ligne ExecStart sauvegardée (« server start --port N --bind A »).
+restore_health_target() {
+  [[ "${HAD_UNIT}" == "true" ]] || return 0
+  local line port="" bind=""
+  line="$(grep -m1 '^ExecStart=' "${WORK_DIR}/managed.previous/0" 2>/dev/null)" \
+    || return 0
+  if [[ "${line}" =~ --port[[:space:]]+([0-9]+) ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${line}" =~ --bind[[:space:]]+([A-Za-z0-9_.:-]+) ]]; then
+    bind="${BASH_REMATCH[1]}"
+  fi
+  [[ -n "${port}" && -n "${bind}" ]] || return 0
+
+  SERVER_PORT="${port}"
+  BIND_ADDR="${bind}"
+  HEALTH_HOST="$(health_host_for "${bind}")"
+  HEALTH_PATH=""
 }
 
 # Unique chemin de restauration ciblée, partagé par install, update et
@@ -986,6 +1308,7 @@ recover() {
   fi
 
   restore_unit_state || restored="false"
+  restore_health_target
   systemctl reset-failed "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   # Sans purge ici, des échecs répétés accumuleraient un bundle de démon
   # (plusieurs Go) par tentative jusqu'à la prochaine réussite.
@@ -1030,6 +1353,62 @@ daemon_version_installed() {
   [[ -x "${LMSTUDIO_HOME}/llmster/${version}/llmster" ]]
 }
 
+INSTALLER_SHELL=""
+
+# Extrait la valeur de l'affectation « $2=… » du fichier $1 (première
+# occurrence en début de ligne), guillemets simples ou doubles retirés.
+installer_assignment() {
+  awk -v key="$2" '
+    index($0, key "=") == 1 {
+      value = substr($0, length(key) + 2)
+      sub(/[[:space:]]*(#.*)?$/, "", value)
+      if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      print value
+      exit
+    }' "$1"
+}
+
+# Vérifie que $1 ressemble bien à l'installeur de llmster : taille plausible,
+# shebang sh ou bash, APP_NAME=llmster et APP_VERSION valide. Renseigne
+# INSTALLER_VERSION et INSTALLER_SHELL (interpréteur à utiliser).
+validate_installer() {
+  local file="$1" size first_line=""
+
+  [[ -s "${file}" ]] || {
+    warn "Installeur vide."
+    return 1
+  }
+  size="$(wc -c <"${file}")"
+  if (( size > 1048576 )); then
+    warn "Installeur anormalement gros (${size} octets) : ce n'est pas le script attendu."
+    return 1
+  fi
+
+  read -r first_line <"${file}" || true
+  first_line="${first_line%$'\r'}"
+  case "${first_line}" in
+    '#!/bin/sh'|'#!/usr/bin/env sh')     INSTALLER_SHELL="sh" ;;
+    '#!/bin/bash'|'#!/usr/bin/env bash') INSTALLER_SHELL="bash" ;;
+    *)
+      warn "L'installeur téléchargé n'a pas de shebang sh ou bash reconnu."
+      return 1
+      ;;
+  esac
+
+  if [[ "$(installer_assignment "${file}" APP_NAME)" != "llmster" ]]; then
+    warn "L'installeur téléchargé ne correspond pas à llmster (APP_NAME)."
+    return 1
+  fi
+
+  INSTALLER_VERSION="$(installer_assignment "${file}" APP_VERSION)"
+  if ! valid_installer_version "${INSTALLER_VERSION}"; then
+    warn "Version absente ou invalide dans l'installeur officiel (APP_VERSION)."
+    return 1
+  fi
+}
+
 # Télécharge l'installeur officiel et vérifie qu'il ressemble bien à celui
 # de llmster (shebang, APP_NAME, version) avant tout arrêt du service.
 fetch_installer() {
@@ -1040,27 +1419,10 @@ fetch_installer() {
     --retry-all-errors --connect-timeout 15 --max-time 180 \
     "${INSTALLER_URL}" -o "${dest}" || return 1
 
-  [[ -s "${dest}" ]] || {
-    warn "Installeur vide."
+  validate_installer "${dest}" || {
+    hint "Le format de ${INSTALLER_URL} a peut-être changé : rien n'a été arrêté ni modifié."
     return 1
   }
-
-  local first_line=""
-  read -r first_line <"${dest}" || true
-  [[ "${first_line}" == "#!/bin/sh" ]] || {
-    warn "L'installeur téléchargé n'a pas le shebang attendu."
-    return 1
-  }
-  grep -q 'APP_NAME="llmster"' "${dest}" || {
-    warn "L'installeur téléchargé ne correspond pas à llmster."
-    return 1
-  }
-
-  INSTALLER_VERSION="$(awk -F'"' '/^APP_VERSION=/{print $2; exit}' "${dest}")"
-  if ! valid_installer_version "${INSTALLER_VERSION}"; then
-    warn "Version absente ou invalide dans l'installeur officiel."
-    return 1
-  fi
   log "   Version proposée : ${INSTALLER_VERSION}"
 
   install -m 0755 -o "${LMS_USER}" -g "$(id -gn "${LMS_USER}")" \
@@ -1073,7 +1435,7 @@ run_installer() {
   step "📦 Installation de llmster pour ${LMS_USER}"
   # Le service emploie un chemin absolu : inutile de modifier .bashrc/.profile
   # à chaque installation ou mise à jour.
-  as_user env LMS_NO_MODIFY_PATH=1 sh "${INSTALLER_PATH}"
+  as_user env LMS_NO_MODIFY_PATH=1 "${INSTALLER_SHELL}" "${INSTALLER_PATH}"
 }
 
 # --- Commandes ---------------------------------------------------------------
@@ -1122,8 +1484,8 @@ cmd_install() {
   fi
 
   step "🧩 Configuration du service systemd"
-  if ! write_unit; then
-    recover binaries "${was_active}" "Impossible de valider ou d'écrire l'unité systemd."
+  if ! write_units; then
+    recover binaries "${was_active}" "Impossible de valider ou d'écrire les unités systemd."
   fi
   if ! systemctl enable "${SERVICE_NAME}.service"; then
     recover binaries "${was_active}" "Impossible d'activer le service systemd."
@@ -1144,6 +1506,8 @@ cmd_install() {
   else
     log "⚠️  Service démarré ; le serveur HTTP répond, sans validation authentifiée."
   fi
+  check_preload
+  apply_watchdog
   network_warning
   if [[ "${ENABLE_LM_LINK}" == "true" ]]; then
     show_link_status
@@ -1217,8 +1581,8 @@ cmd_update() {
 
   # Une mise à jour applique également les évolutions de l'unité générée par ce
   # script, tout en conservant son état enabled/disabled.
-  if ! write_unit; then
-    recover binaries "${was_active}" "La nouvelle unité systemd est invalide."
+  if ! write_units; then
+    recover binaries "${was_active}" "Les nouvelles unités systemd sont invalides."
   fi
 
   step "🚀 Vérification de la nouvelle version"
@@ -1230,6 +1594,8 @@ cmd_update() {
     recover binaries "${was_active}" \
       "L'API ne répond pas après ${HEALTH_TIMEOUT}s avec la nouvelle version."
   fi
+  # Lu avant un éventuel retour à l'arrêt, tant que le résultat est frais.
+  check_preload
 
   if [[ "${was_active}" == "false" ]]; then
     systemctl stop "${SERVICE_NAME}.service" \
@@ -1250,6 +1616,7 @@ cmd_update() {
   if [[ -z "${PRELOAD_MODEL}" ]]; then
     log "   Aucun modèle rechargé de force ; le prochain appel pourra utiliser le JIT."
   fi
+  apply_watchdog
   prune_failed_artifacts || warn "Purge des quarantaines impossible."
   finish_health_result
 }
@@ -1268,14 +1635,16 @@ cmd_configure() {
   service_active && was_active="true"
 
   step "🧩 Application de ${CONFIG_FILE}"
-  if ! write_unit; then
+  if ! write_units; then
     recover unit "${was_active}" \
-      "Impossible de valider ou d'écrire la nouvelle unité."
+      "Impossible de valider ou d'écrire les nouvelles unités."
   fi
 
   if [[ "${was_active}" == "false" ]]; then
-    # Aucune sonde n'a tourné ici : pas de verdict de santé à rendre.
+    # Aucune sonde n'a tourné ici : pas de verdict de santé à rendre. Le timer
+    # peut être armé sans risque : il ignore un service arrêté.
     ok "Configuration appliquée ; le service reste arrêté comme avant."
+    apply_watchdog
     network_warning
     return 0
   fi
@@ -1295,6 +1664,8 @@ cmd_configure() {
   else
     log "⚠️  Configuration appliquée ; le serveur répond, sans validation authentifiée."
   fi
+  check_preload
+  apply_watchdog
   network_warning
   finish_health_result
 }
@@ -1335,6 +1706,7 @@ cmd_start() {
     else
       log "⚠️  Service démarré ; le serveur répond, sans validation authentifiée."
     fi
+    check_preload
     network_warning
     finish_health_result
   else
@@ -1342,7 +1714,9 @@ cmd_start() {
   fi
 }
 
-# stop : arrête le service et le démon.
+# stop : arrête le service et le démon. Le timer de surveillance reste armé :
+# il ignore un service arrêté, et « start » suffit à retrouver la protection.
+# N'annonce l'arrêt que s'il est constaté.
 cmd_stop() {
   if [[ -f "${UNIT_PATH}" ]]; then
     if ! systemctl stop "${SERVICE_NAME}.service"; then
@@ -1351,6 +1725,17 @@ cmd_stop() {
   fi
   if lms_installed; then
     lms_cli daemon down >/dev/null 2>&1 || true
+  fi
+
+  if service_active; then
+    die "Le service ${SERVICE_NAME} est toujours actif. Voir : journalctl -u ${SERVICE_NAME} -n 100"
+  fi
+  local deadline=$((SECONDS + 5))
+  while daemon_process_running && (( SECONDS < deadline )); do
+    sleep 1
+  done
+  if daemon_process_running; then
+    warn "Un processus llmster tourne encore sous ${LMS_USER} : pgrep -a -u ${LMS_USER} -x llmster"
   fi
   step "🛑 Service ${SERVICE_NAME} arrêté."
 }
@@ -1384,6 +1769,20 @@ cmd_status() {
     systemctl status "${SERVICE_NAME}.service" --no-pager || true
   else
     warn "Unité absente : ${UNIT_PATH}"
+  fi
+
+  log ""
+  step "── Surveillance ──"
+  if [[ -f "${WATCHDOG_TIMER_PATH}" ]]; then
+    systemctl list-timers "${SERVICE_NAME}-watchdog.timer" --all --no-pager \
+      2>/dev/null | sed -n '1,2p' || true
+    if ! systemctl is-active --quiet "${SERVICE_NAME}-watchdog.timer"; then
+      warn "Timer de surveillance installé mais inactif : sudo ${SCRIPT_NAME} configure"
+    fi
+  elif (( WATCHDOG_INTERVAL > 0 )); then
+    warn "Surveillance demandée mais non installée : sudo ${SCRIPT_NAME} configure"
+  else
+    log "   Désactivée (WATCHDOG_INTERVAL=0)."
   fi
 
   if lms_installed && [[ "${api_available}" == "true" ]]; then
@@ -1452,9 +1851,19 @@ cmd_logs() {
   log "Flux des requêtes : sudo -u ${LMS_USER} -H ${LMS_BIN} log stream"
 }
 
-# models : modèles chargés en mémoire et présents sur disque.
+# models : modèles chargés en mémoire et présents sur disque. Comme status,
+# n'appelle lms que si l'API répond : sinon le CLI démarrerait un démon hors
+# systemd, qui bloquerait ensuite « update ».
 cmd_models() {
+  require_cmds curl
   require_installed
+  prepare_auth || die "Impossible de préparer l'authentification de la sonde."
+  local rc=0
+  health_probe || rc=$?
+  if (( rc != 0 && rc != 2 )); then
+    die "API indisponible sur le port ${SERVER_PORT} : démarre d'abord le service (sudo ${SCRIPT_NAME} start)."
+  fi
+
   step "── En mémoire ──"
   lms_cli ps || true
   log ""
@@ -1469,11 +1878,10 @@ cmd_check() {
     prepare_auth || die "Configuration API_TOKEN_FILE invalide."
   fi
 
-  local candidate="${WORK_DIR}/${SERVICE_NAME}.service"
-  render_unit >"${candidate}"
+  render_candidates || die "Génération des unités impossible."
   if lms_installed; then
-    verify_unit_file "${candidate}" \
-      || die "L'unité systemd générée n'est pas valide."
+    verify_candidates \
+      || die "Les unités systemd générées ne sont pas valides."
   else
     warn "llmster n'est pas encore installé : contrôle systemd approfondi ignoré."
   fi
@@ -1484,6 +1892,11 @@ cmd_check() {
   log "   Service     : ${SERVICE_NAME}.service"
   log "   API         : ${BIND_ADDR}:${SERVER_PORT}"
   log "   Sonde       : ${HEALTH_CANDIDATES[*]}"
+  if (( WATCHDOG_INTERVAL > 0 )); then
+    log "   Surveillance: toutes les ${WATCHDOG_INTERVAL}s (${WATCHDOG_HELPER_PATH})"
+  else
+    log "   Surveillance: désactivée"
+  fi
   log "   Sauvegarde  : ${BACKUP_DIR} — $(backup_disk_usage), rétention ${FAILED_RETENTION}"
   if [[ -z "${PRELOAD_MODEL}" ]]; then
     warn "Aucun préchargement. Active le JIT dans LM Studio si tu le souhaites."
@@ -1503,8 +1916,13 @@ cmd_uninstall() {
   cmd_stop
   systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
 
+  UNITS_CHANGED="false"
+  remove_watchdog_files
   if [[ -f "${UNIT_PATH}" ]]; then
     rm -f -- "${UNIT_PATH}"
+    UNITS_CHANGED="true"
+  fi
+  if [[ "${UNITS_CHANGED}" == "true" ]]; then
     systemctl daemon-reload
   fi
 
@@ -1560,6 +1978,7 @@ Configuration — ${CONFIG_FILE} (root:root, mode 0644 ou plus restrictif) :
   ENABLE_LM_LINK=${ENABLE_LM_LINK}
   API_TOKEN_FILE=${API_TOKEN_FILE:-<vide>}
   FAILED_RETENTION=${FAILED_RETENTION}          # quarantaines d'échec conservées
+  WATCHDOG_INTERVAL=${WATCHDOG_INTERVAL}        # surveillance de l'API (s), 0 = désactivée
 
   Ces variables peuvent aussi être passées par l'environnement ; le fichier
   de configuration, chargé ensuite, a priorité.
@@ -1572,15 +1991,22 @@ Si l'authentification LM Studio est activée :
 
 Variables d'environnement :
   NO_COLOR            désactive les couleurs si elle est définie
+  LMSCTL_CONFIG       autre fichier de configuration (mêmes contrôles de droits)
 
 Codes de sortie :
   0  opération réussie et vérifiée
   1  échec (une restauration ciblée a pu être tentée : lire les messages)
   2  opération conservée, mais contrôle authentifié impossible (HTTP 401/403)
+  3  opération conservée, API saine, mais le préchargement de PRELOAD_MODEL a échoué
 
 Notes :
   - PRELOAD_MODEL vide ne suffit pas à activer le JIT : règle-le dans LM Studio.
-  - LOAD_ARGS est lu depuis un fichier root ; contrôles de ligne et « % » sont refusés.
+  - PRELOAD_MODEL est chargé après le démarrage de l'API, sans bloquer : un
+    échec de chargement n'annule jamais une mise à jour (code 3).
+  - LOAD_ARGS est lu depuis un fichier root ; contrôles, « % », « \$ », « \\ » et
+    « ; » sont refusés (systemd les interpréterait).
+  - Le timer ${SERVICE_NAME}-watchdog.timer redémarre le service après 3 sondes
+    muettes. Il ignore un service arrêté ou en échec, et s'efface devant lmsctl.
   - Avec 0.0.0.0, active Require Authentication et filtre le port au pare-feu.
   - Un rejet HTTP 401/403 conserve l'opération mais renvoie le code 2 : corrige
     API_TOKEN_FILE avant de considérer le contrôle comme sain.
@@ -1627,7 +2053,7 @@ main() {
   install -d -m 0755 "${LOCK_FILE%/*}"
   exec 9>"${LOCK_FILE}"
   if ! flock -n 9; then
-    die "Une autre instance de ${SCRIPT_NAME} est en cours."
+    die "Une autre instance de ${SCRIPT_NAME}, ou la surveillance de l'API, est en cours. Réessaie dans un instant."
   fi
 
   RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
